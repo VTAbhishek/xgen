@@ -1,0 +1,46 @@
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteBase /
+
+  # Send all requests to index.html (SPA routing)
+  RewriteRule ^index\.html$ - [L]
+  RewriteCond %{REQUEST_FILENAME} !-f
+  RewriteCond %{REQUEST_FILENAME} !-d
+  # ...except build assets. A page left over from an older build asks for
+  # bundles that no longer exist; answering those with index.html hands it HTML
+  # where it expected a module. Let them 404 so the failure is honest.
+  RewriteCond %{REQUEST_URI} !^/assets/
+  RewriteRule . /index.html [L]
+</IfModule>
+
+# Cache static assets. Their filenames carry a content hash, so a new build
+# means a new name — they can be held forever and never go stale.
+<IfModule mod_expires.c>
+  ExpiresActive On
+  ExpiresByType text/css "access plus 1 year"
+  ExpiresByType application/javascript "access plus 1 year"
+  ExpiresByType image/svg+xml "access plus 1 year"
+  ExpiresByType image/png "access plus 1 year"
+  ExpiresByType image/jpeg "access plus 1 year"
+  ExpiresByType image/webp "access plus 1 year"
+  ExpiresByType font/woff2 "access plus 1 year"
+
+  # index.html is the one file whose name never changes, and it is what points
+  # at the current hashed bundles. Cached even briefly, the browser keeps
+  # loading the previous build after a deploy — so it must always be re-fetched.
+  ExpiresByType text/html "access plus 0 seconds"
+</IfModule>
+
+<IfModule mod_headers.c>
+  <FilesMatch "\.html$">
+    Header set Cache-Control "no-cache, must-revalidate, max-age=0"
+  </FilesMatch>
+  <FilesMatch "\.(js|css|woff2|svg|png|jpe?g|webp)$">
+    Header set Cache-Control "public, max-age=31536000, immutable"
+  </FilesMatch>
+</IfModule>
+
+# Gzip
+<IfModule mod_deflate.c>
+  AddOutputFilterByType DEFLATE text/html text/plain text/css application/javascript application/json
+</IfModule>

@@ -1,0 +1,431 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Http\Requests\StoreInvoiceRequest;
+use App\Models\Customer;
+use App\Models\Invoice;
+use App\Models\Item;
+use App\Models\ItemBatch;
+use App\Models\PhoneUnit;
+use App\Services\NumberService;
+use App\Services\ReturnCreditService;
+use App\Services\SettlementService;
+use App\Services\StockService;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+
+class InvoiceController extends Controller
+{
+    /**
+     * What the printed invoice needs off each line: the item code it prints per
+     * row, and whether that item is a composite product — the printed slip only
+     * carries the distributor letterhead when a product was actually sold.
+     */
+    private const PRINT_LINE_RELATIONS = [
+        'lines.item:id,code,name',
+        'lines.item.product:id,item_id',
+        // Serialised lines print an IMEI per handset.
+        'lines.units:id,invoice_line_id,imei,colour,storage,battery',
+    ];
+
+    /**
+     * Declared the long way round: the live server runs PHP 7.4, where
+     * constructor property promotion is a parse error.
+     *
+     * @var ReturnCreditService
+     */
+    private $credits;
+
+    public function __construct(ReturnCreditService $credits)
+    {
+        $this->credits = $credits;
+    }
+
+    public function index(Request $request): JsonResponse
+    {
+        $q = trim((string) $request->input('q'));
+        $type = trim((string) $request->input('type'));
+        // A handset leaves the shop once, so its IMEI names exactly one bill —
+        // the way back to the sale when a customer walks in holding the phone.
+        $imei = trim((string) $request->input('imei'));
+
+        $rows = Invoice::query()
+            ->with(['customer:id,code,name,address', 'lines'])
+            ->when($q !== '', fn ($qb) => $qb->where(function ($w) use ($q) {
+                $w->where('no', 'like', "%{$q}%")
+                    ->orWhereHas('customer', fn ($c) => $c->where('name', 'like', "%{$q}%"));
+            }))
+            ->when($imei !== '', fn ($qb) => $qb->whereHas(
+                'lines.units',
+                fn ($u) => $u->where('imei', 'like', "%{$imei}%"),
+            ))
+            ->when(in_array($type, ['cash', 'credit']), fn ($qb) => $qb->where('type', $type))
+            ->orderByDesc('date')->orderByDesc('id')
+            ->limit(500)
+            ->get();
+
+        return response()->json(['data' => $rows]);
+    }
+
+    public function show(Invoice $invoice): JsonResponse
+    {
+        return response()->json([
+            // `returns` so the bill can show what came back off it.
+            'data' => $invoice->load([
+                'customer', ...self::PRINT_LINE_RELATIONS, 'cheques',
+                'returns:id,no,date,invoice_id,total',
+                'returns.lines', 'returns.lines.item:id,code,name',
+            ]),
+        ]);
+    }
+
+    public function store(StoreInvoiceRequest $request): JsonResponse
+    {
+        $data = $request->validated();
+        $taxRate = $this->allowedTaxRate($request, $data);
+
+        $invoice = DB::transaction(function () use ($data, $taxRate, $request) {
+            $invoice = new Invoice([
+                'no' => NumberService::next(Invoice::class, NumberService::invoicePrefix()),
+                'date' => now()->toDateString(),
+                'created_by' => optional($request->user())->id,
+            ]);
+
+            $this->applyInvoiceData($invoice, $data, $taxRate);
+            app(StockService::class)->projectMany(collect($data['lines'])->pluck('item_id')->all());
+
+            return $invoice;
+        });
+
+        return response()->json([
+            'data' => $invoice->fresh(['customer', ...self::PRINT_LINE_RELATIONS, 'cheques']),
+        ], 201);
+    }
+
+    public function update(StoreInvoiceRequest $request, Invoice $invoice): JsonResponse
+    {
+        abort_if((bool) $invoice->cancelled_at, 422, 'This invoice is cancelled and can no longer be edited.');
+
+        // Editing re-applies the invoice from scratch (paid resets to the advance),
+        // which would wipe any collections / cleared cheques recorded against it.
+        // Block it once money has been collected beyond the up-front advance.
+        abort_if(
+            round((float) $invoice->paid - (float) $invoice->advance, 2) > 0,
+            422,
+            'This invoice has collections or cleared cheques recorded. Reverse them (un-clear its cheques and delete its receipts) before editing.'
+        );
+
+        $data = $request->validated();
+        $taxRate = $this->allowedTaxRate($request, $data);
+
+        DB::transaction(function () use ($invoice, $data, $taxRate) {
+            $ids = $invoice->lines()->pluck('item_id')->all();
+            // Undo the old invoice's effects, then re-apply from the edited data.
+            $this->reverseInvoiceEffects($invoice);
+            $invoice->lines()->delete();
+            $invoice->cheques()->delete();
+            $this->applyInvoiceData($invoice, $data, $taxRate);
+            app(StockService::class)->projectMany(array_merge($ids, collect($data['lines'])->pluck('item_id')->all()));
+        });
+
+        return response()->json([
+            'data' => $invoice->fresh(['customer', ...self::PRINT_LINE_RELATIONS, 'cheques']),
+        ]);
+    }
+
+    /**
+     * Cancel an invoice: reverse its stock + receivable (and any receipts posted
+     * against it), but keep the record marked cancelled for the audit trail.
+     */
+    public function cancel(Invoice $invoice, SettlementService $posting): JsonResponse
+    {
+        abort_if((bool) $invoice->cancelled_at, 422, 'This invoice is already cancelled.');
+
+        DB::transaction(function () use ($invoice, $posting) {
+            $ids = $invoice->lines()->pluck('item_id')->all();
+            $posting->purgeSettlementsForInvoice($invoice);
+            $invoice->refresh();
+            $this->reverseInvoiceEffects($invoice); // restores item stock + reverses receivable
+            $invoice->cheques()->delete();          // record-only cheques no longer apply
+            $this->credits->release($invoice);      // return credit goes back to the customer
+            $invoice->fill([
+                'cancelled_at' => now(),
+                'return_credit' => 0,
+                'paid' => 0,
+                'advance' => 0,
+                'status' => 'unpaid',
+            ])->save();
+            app(StockService::class)->projectMany($ids);
+        });
+
+        return response()->json(['data' => $invoice->fresh(['customer', 'lines'])]);
+    }
+
+    /**
+     * Tax may only be charged by a user granted the "tax_control" capability
+     * (admins always). Everyone else bills at 0% whatever the client sends.
+     */
+    private function allowedTaxRate(Request $request, array $data): float
+    {
+        $user = $request->user();
+
+        return ($user && $user->can_use('tax_control')) ? (float) ($data['tax_rate'] ?? 0) : 0.0;
+    }
+
+    /**
+     * Compute totals from the request, persist the invoice + lines + cheques,
+     * decrement item stock and apply the credit receivable. Shared by store/update.
+     */
+    /**
+     * Load and check the handsets each line is selling, keyed by line index.
+     *
+     * Locked for update so two tills cannot sell the same phone at once — the
+     * status check below is only meaningful while the row is held.
+     *
+     * @param  array<int, array<string, mixed>>  $lines
+     * @param  \Illuminate\Support\Collection<int, Item>  $items
+     * @return array<int, \Illuminate\Support\Collection<int, PhoneUnit>>
+     */
+    private function resolveSoldUnits(array $lines, $items): array
+    {
+        $ids = collect($lines)->pluck('unit_ids')->filter()->flatten()->map('intval');
+        abort_if($ids->count() !== $ids->unique()->count(), 422, 'The same handset is on this invoice twice.');
+
+        if ($ids->isEmpty()) {
+            return [];
+        }
+
+        $units = PhoneUnit::query()->whereIn('id', $ids)->lockForUpdate()->get()->keyBy('id');
+
+        $out = [];
+        foreach ($lines as $idx => $line) {
+            $lineIds = collect($line['unit_ids'] ?? [])->map('intval');
+            if ($lineIds->isEmpty()) {
+                continue;
+            }
+
+            $item = $items[$line['item_id']];
+            $picked = $lineIds->map(function ($id) use ($units, $item) {
+                /** @var PhoneUnit|null $unit */
+                $unit = $units[$id] ?? null;
+                abort_if(! $unit, 422, 'That handset is no longer on file.');
+                abort_if((int) $unit->item_id !== (int) $item->id, 422, "IMEI {$unit->imei} is not a {$item->name}.");
+                abort_if($unit->status !== 'in_stock', 422, "IMEI {$unit->imei} has already been sold.");
+
+                return $unit;
+            });
+
+            $out[$idx] = $picked;
+        }
+
+        return $out;
+    }
+
+    private function applyInvoiceData(Invoice $invoice, array $data, float $taxRate): void
+    {
+        $customer = Customer::query()->findOrFail($data['customer_id']);
+
+        // Lock items + the chosen cost-batches
+        $itemIds = collect($data['lines'])->pluck('item_id')->unique();
+        $items = Item::query()->whereIn('id', $itemIds)->lockForUpdate()->get()->keyBy('id');
+        $batchIds = collect($data['lines'])->pluck('batch_id')->filter()->unique();
+        $batches = ItemBatch::query()->whereIn('id', $batchIds)->lockForUpdate()->get()->keyBy('id');
+
+        // "Old stock" available per item = total stock minus everything still
+        // held in cost-batches. Non-batch (old-stock) lines draw from this pool
+        // so the batch quantities and item stock never drift apart.
+        $batchHeld = ItemBatch::query()->whereIn('item_id', $itemIds)
+            ->selectRaw('item_id, COALESCE(SUM(qty_remaining), 0) AS held')
+            ->groupBy('item_id')->pluck('held', 'item_id');
+        $looseLeft = [];
+        foreach ($items as $id => $it) {
+            $looseLeft[$id] = (int) $it->stock - (int) ($batchHeld[$id] ?? 0);
+        }
+
+        $pickedUnits = $this->resolveSoldUnits($data['lines'], $items);
+
+        $subtotal = 0;
+        $linesOut = [];
+        foreach ($data['lines'] as $idx => $line) {
+            /** @var Item $item */
+            $item = $items[$line['item_id']];
+            $price = (float) $line['price'];
+            $units = $pickedUnits[$idx] ?? collect();
+
+            if ($units->isNotEmpty()) {
+                // One handset, one unit of stock. The batch is not on the line —
+                // phones on the same line may have come in on different GRNs —
+                // so each one draws down the batch it arrived in.
+                $qty = $units->count();
+                $batchId = null;
+            } else {
+                $qty = (int) $line['qty'];
+                $batchId = $line['batch_id'] ?? null;
+
+                if ($batchId) {
+                    $batch = $batches[$batchId] ?? null;
+                    abort_if(! $batch || (int) $batch->item_id !== (int) $item->id, 422, "Invalid batch for {$item->name}");
+                    abort_if($batch->qty_remaining < $qty, 422, "Only {$batch->qty_remaining} left in the selected batch for {$item->name}");
+                } else {
+                    $loose = $looseLeft[$item->id] ?? (int) $item->stock;
+                    abort_if($loose < $qty, 422, "Only {$loose} old stock left for {$item->name} — pick a cost-batch for the rest.");
+                    $looseLeft[$item->id] = $loose - $qty;
+                }
+            }
+
+            $total = round($qty * $price, 2);
+            $subtotal += $total;
+            $linesOut[] = [
+                'item_id' => $item->id,
+                'batch_id' => $batchId,
+                'name' => $item->name,
+                'qty' => $qty,
+                'price' => $price,
+                'total' => $total,
+                'units' => $units,
+            ];
+        }
+
+        // Cash / cheque / credit discounts applied independently. Rates come from the client request.
+        $cashRate = isset($data['cash_discount']) ? (float) $data['cash_discount'] : 0.0;
+        $chequeRate = isset($data['cheque_discount']) ? (float) $data['cheque_discount'] : 0.0;
+        $creditRate = isset($data['credit_discount']) ? (float) $data['credit_discount'] : 0.0;
+        $discountAmount = round(
+            round($subtotal * $cashRate / 100, 2)
+            + round($subtotal * $chequeRate / 100, 2)
+            + round($subtotal * $creditRate / 100, 2),
+            2
+        );
+        $taxable = round($subtotal - $discountAmount, 2);
+        $taxAmount = round($taxable * $taxRate / 100, 2);
+        $billed = round($taxable + $taxAmount, 2);
+
+        $type = $data['type'];
+
+        // Everything except the return credit, which cannot be booked until the
+        // invoice has an id to book it against.
+        $invoice->fill([
+            'type' => $type,
+            'customer_id' => $data['customer_id'],
+            'subtotal' => $subtotal,
+            'cash_discount' => $cashRate,
+            'cheque_discount' => $chequeRate,
+            'credit_discount' => $creditRate,
+            'discount_amount' => $discountAmount,
+            'tax_rate' => $taxRate,
+            'tax_amount' => $taxAmount,
+            'return_credit' => 0,
+            'total' => $billed,
+            'paid' => 0,
+            'advance' => 0,
+            'status' => 'unpaid',
+        ]);
+        $invoice->save();
+
+        // Return credit comes off last. It is money the customer was already
+        // charged — and already discounted — on the invoice the goods went out
+        // on, so this bill's discount must not touch it a second time.
+        $returnCredit = $this->credits->apply($invoice, min((float) ($data['return_credit'] ?? 0), $billed));
+        $total = round($billed - $returnCredit, 2);
+
+        $paid = $type === 'cash' ? $total : min((float) ($data['paid'] ?? 0), $total);
+        $balance = round($total - $paid, 2);
+        $status = $balance <= 0 ? 'paid' : ($paid > 0 ? 'partial' : 'unpaid');
+
+        $invoice->fill([
+            'return_credit' => $returnCredit,
+            'total' => $total,
+            'paid' => $paid,
+            // The up-front amount entered on the form. Stays put while cheques
+            // clear / settlements post (those only move `paid`).
+            'advance' => $paid,
+            'status' => $status,
+        ]);
+        $invoice->save();
+
+        foreach ($linesOut as $row) {
+            $units = $row['units'];
+            unset($row['units']);
+            $invoiceLine = $invoice->lines()->create($row);
+            $items[$row['item_id']]->decrement('stock', (int) $row['qty']);
+
+            if ($row['batch_id'] && isset($batches[$row['batch_id']])) {
+                $batches[$row['batch_id']]->decrement('qty_remaining', (int) $row['qty']);
+            }
+
+            // Handsets leave the shelf one at a time, each off its own batch.
+            foreach ($units as $unit) {
+                if ($unit->batch_id) {
+                    ItemBatch::query()->whereKey($unit->batch_id)->decrement('qty_remaining');
+                }
+                $unit->forceFill([
+                    'status' => 'sold',
+                    'invoice_id' => $invoice->id,
+                    'invoice_line_id' => $invoiceLine->id,
+                ])->save();
+            }
+        }
+
+        // Cheque details (record-only — they do not affect the paid/outstanding amounts).
+        foreach ($data['cheques'] ?? [] as $chq) {
+            $invoice->cheques()->create([
+                'cheque_no' => $chq['no'] ?? null,
+                'cheque_date' => $chq['date'] ?? null,
+                'amount' => (float) ($chq['amount'] ?? 0),
+            ]);
+        }
+
+        if ($type === 'credit' && $balance > 0) {
+            Customer::query()->whereKey($data['customer_id'])->increment('balance', $balance);
+        }
+    }
+
+    /**
+     * Undo an invoice's side effects: restore item stock and reverse the credit receivable.
+     */
+    private function reverseInvoiceEffects(Invoice $invoice): void
+    {
+        $invoice->loadMissing('lines');
+
+        foreach ($invoice->lines as $line) {
+            Item::query()->whereKey($line->item_id)->increment('stock', (int) $line->qty);
+            if ($line->batch_id) {
+                ItemBatch::query()->whereKey($line->batch_id)->increment('qty_remaining', (int) $line->qty);
+            }
+        }
+
+        // Handsets sold on this invoice go back on the shelf, each into the
+        // batch it came in on. Their line carries no batch_id, so this is the
+        // only thing that restores those batch quantities.
+        $units = PhoneUnit::query()->where('invoice_id', $invoice->id)->get();
+        foreach ($units as $unit) {
+            if ($unit->batch_id) {
+                ItemBatch::query()->whereKey($unit->batch_id)->increment('qty_remaining');
+            }
+            $unit->forceFill(['status' => 'in_stock', 'invoice_id' => null, 'invoice_line_id' => null])->save();
+        }
+
+        if ($invoice->type === 'credit') {
+            $outstanding = round((float) $invoice->total - (float) $invoice->paid, 2);
+            if ($outstanding > 0) {
+                Customer::query()->whereKey($invoice->customer_id)->decrement('balance', $outstanding);
+            }
+        }
+    }
+
+    /**
+     * Delete a cancelled invoice from the database entirely.
+     */
+    public function destroy(Invoice $invoice): JsonResponse
+    {
+        abort_unless((bool) $invoice->cancelled_at, 422, 'Only cancelled invoices can be deleted.');
+
+        DB::transaction(function () use ($invoice) {
+            $invoice->delete();
+        });
+
+        return response()->json(['message' => 'Invoice deleted successfully']);
+    }
+}

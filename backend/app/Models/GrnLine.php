@@ -1,0 +1,39 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+class GrnLine extends Model
+{
+    protected $fillable = ['grn_id', 'item_id', 'name', 'qty', 'unit_price', 'discount', 'price', 'total'];
+
+    protected $casts = [
+        // PHP < 8.1 returns numeric DB columns as strings; keep ids integers.
+        'grn_id' => 'integer',
+        'item_id' => 'integer',
+        'qty' => 'decimal:2',
+        'unit_price' => 'decimal:2',
+        'discount' => 'decimal:2',
+        'price' => 'decimal:2',
+        'total' => 'decimal:2',
+    ];
+
+    public function grn(): BelongsTo
+    {
+        return $this->belongsTo(Grn::class);
+    }
+
+    public function item(): BelongsTo
+    {
+        return $this->belongsTo(Item::class);
+    }
+
+    /** The individual handsets received on this line, for serialised items. */
+    public function units(): HasMany
+    {
+        return $this->hasMany(PhoneUnit::class, 'grn_line_id');
+    }
+}

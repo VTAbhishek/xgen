@@ -1,0 +1,45 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
+
+class Item extends Model
+{
+    use HasFactory;
+
+    protected $fillable = [
+        'code', 'name', 'category_id',
+        'distributor_price', 'wholesale_price', 'retail_price', 'stock', 'opening_discount',
+    ];
+
+    protected $casts = [
+        // PHP < 8.1 returns numeric DB columns as strings; keep ids integers.
+        'category_id' => 'integer',
+        'opening_discount' => 'decimal:2',
+        'distributor_price' => 'decimal:2',
+        'wholesale_price' => 'decimal:2',
+        'retail_price' => 'decimal:2',
+        'stock' => 'integer',
+    ];
+
+    public function category(): BelongsTo
+    {
+        return $this->belongsTo(Category::class);
+    }
+
+    public function batches(): HasMany
+    {
+        return $this->hasMany(ItemBatch::class);
+    }
+
+    /** Set when this item is a composite product built from other items. */
+    public function product(): HasOne
+    {
+        return $this->hasOne(Product::class);
+    }
+}

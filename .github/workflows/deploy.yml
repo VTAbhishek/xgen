@@ -1,0 +1,71 @@
+name: Deploy to server
+
+# Auto-deploy එක off කරලා. දැන් live එකට යන්නේ අතින් run කළොත් විතරයි:
+# GitHub → Actions → "Deploy to server" → Run workflow.
+# (ආයෙත් auto ඕන නම් පහත push block එකේ comment අයින් කරන්න.)
+on:
+  # push:
+  #   branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) Repo එක checkout කරගන්නවා
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ---------- FRONTEND (React) build ----------
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+      # ---------- Deploy BACKEND (Laravel) via FTPS ----------
+      # vendor එක server එකේ දැනටමත් තියෙනවා -> exclude කරලා (packages වෙනස් වුණාම විතරයි නැවත ඕන)
+      # .env, storage overwrite/delete වෙන්නේ නෑ
+      - name: Deploy backend
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_HOST }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          timeout: 120000
+          local-dir: ./backend/
+          server-dir: /backend/
+          exclude: |
+            **/.git*
+            **/.git*/**
+            **/node_modules/**
+            vendor/**
+            .env
+            .env.*
+            storage/**
+            artisan.zip
+
+      # ---------- Deploy FRONTEND (built dist) via FTPS ----------
+      - name: Deploy frontend
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_HOST }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          timeout: 120000
+          local-dir: ./frontend/dist/
+          server-dir: /frontend/
+          # .htaccess ගොනුවත් යවනවා. ඒක තමයි index.html cache නොවෙන්න
+          # කියන rule එක තියෙන්නේ — ඒක නොගියොත් deploy එකකට පස්සෙත් browser
+          # එකට පරණ build එකම පේනවා. frontend/public/.htaccess = මූලාශ්‍රය.
+          exclude: |
+            **/.git*
+            **/.git*/**

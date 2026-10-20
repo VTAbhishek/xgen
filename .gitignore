@@ -1,0 +1,35 @@
+# Dependencies and build output — restored by composer / npm, never committed.
+**/node_modules/
+**/vendor/
+frontend/dist/
+
+# Environment files hold database credentials and app keys. The examples and the
+# frontend's build-time API URL are the only ones that belong in the repo.
+**/.env
+**/.env.*
+!**/.env.example
+!frontend/.env.production
+
+# Laravel runtime: logs, caches and compiled views are per-machine.
+backend/storage/logs/*.log
+backend/storage/framework/cache/data/*
+backend/storage/framework/sessions/*
+backend/storage/framework/views/*
+backend/bootstrap/cache/*.php
+backend/.phpunit.result.cache
+
+# Copies of files replaced along the way, kept on disk only because this folder
+# had no version control until now.
+.backup-old-invoice-slip/
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# An old deployment bundle of the backend, 13MB of build output.
+backend/artisan.zip
