@@ -41,7 +41,9 @@ jobs:
           protocol: ftps
           timeout: 120000
           local-dir: ./backend/
-          server-dir: /backend/
+          # FTP account root = ituneslanka.coderootsolutions.com/ (domain root).
+          # Live Laravel එක තියෙන්නේ laravel/ folder එකේ (laravel.php එකෙන් load වෙනවා).
+          server-dir: /laravel/
           exclude: |
             **/.git*
             **/.git*/**
@@ -62,10 +64,12 @@ jobs:
           protocol: ftps
           timeout: 120000
           local-dir: ./frontend/dist/
-          server-dir: /frontend/
-          # .htaccess ගොනුවත් යවනවා. ඒක තමයි index.html cache නොවෙන්න
-          # කියන rule එක තියෙන්නේ — ඒක නොගියොත් deploy එකකට පස්සෙත් browser
-          # එකට පරණ build එකම පේනවා. frontend/public/.htaccess = මූලාශ්‍රය.
+          # Live site එක domain root එකෙන්ම serve වෙනවා.
+          server-dir: /
+          # .htaccess යවන්නේ නෑ: root එකේ තියෙන live .htaccess එකේ /api, /sanctum
+          # laravel.php එකට යවන rules තියෙනවා. frontend/public/.htaccess එකෙන්
+          # ඒක overwrite වුණොත් API එක කැඩෙනවා. Cache rules ඕන නම් live එකට අතින් එකතු කරන්න.
           exclude: |
             **/.git*
             **/.git*/**
+            .htaccess
