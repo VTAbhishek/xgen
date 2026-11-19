@@ -61,6 +61,27 @@ http.interceptors.response.use(undefined, async (err: AxiosError) => {
   return http(cfg);
 });
 
+/**
+ * CodeRoot site guard: while the site is switched off for billing, the API
+ * answers every call with 503 and `X-CodeRoot-Guard: blocked`, carrying the
+ * "temporarily unavailable" page. Show that page in place of the app. The
+ * decision is the server's; this only displays it.
+ */
+let siteBlockedShown = false;
+http.interceptors.response.use(undefined, (err: AxiosError<{ page?: string }>) => {
+  const res = err.response;
+  if (!siteBlockedShown && res?.status === 503 && res.headers?.['x-coderoot-guard'] === 'blocked') {
+    const page = res.data?.page;
+    if (typeof page === 'string' && page) {
+      siteBlockedShown = true;
+      document.open();
+      document.write(page);
+      document.close();
+    }
+  }
+  return Promise.reject(err);
+});
+
 export type ApiError = AxiosError<{ message?: string; errors?: Record<string, string[]> }>;
 
 export function apiErrorMessage(e: unknown, fallback = 'Something went wrong'): string {

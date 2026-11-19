@@ -28,6 +28,14 @@ return [
         'key' => env('RESEND_KEY'),
     ],
 
+    // CodeRoot site guard (app/Http/Middleware/CodeRootGuard.php).
+    // Empty key or secret = guard switched off (local development).
+    'coderoot' => [
+        'site_key' => env('CODEROOT_SITE_KEY'),
+        'secret' => env('CODEROOT_SITE_SECRET'),
+        'status_url' => env('CODEROOT_STATUS_URL', 'https://coderootsolutions.com/api/v1/site-status/'),
+    ],
+
     'slack' => [
         'notifications' => [
             'bot_user_oauth_token' => env('SLACK_BOT_USER_OAUTH_TOKEN'),

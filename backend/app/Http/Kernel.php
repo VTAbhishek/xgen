@@ -15,6 +15,9 @@ class Kernel extends HttpKernel
         \App\Http\Middleware\TrustHosts::class,
         \App\Http\Middleware\TrustProxies::class,
         \Fruitcake\Cors\HandleCors::class,
+        // After CORS so the 503 page still carries CORS headers; before
+        // everything else so a blocked site does no other work.
+        \App\Http\Middleware\CodeRootGuard::class,
         \App\Http\Middleware\PreventRequestsDuringMaintenance::class,
         \Illuminate\Foundation\Http\Middleware\ValidatePostSize::class,
         \App\Http\Middleware\TrimStrings::class,
